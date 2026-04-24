@@ -990,6 +990,7 @@ int split_tlb_vmcall_dispatch(struct kvm_vcpu *vcpu)
 	switch (rcx) {
 		case 0x0000:
 			result = 1;
+			kvm_rax_write(vcpu, vcpu->kvm->splitpages->vmcounter);
 			break;
 		case 0x0001:
 			result = split_tlb_setdatapage(vcpu,rbx,rbx,cr3);
