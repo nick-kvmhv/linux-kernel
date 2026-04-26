@@ -3992,6 +3992,11 @@ u32 vmx_exec_control(struct vcpu_vmx *vmx)
 				CPU_BASED_MONITOR_EXITING);
 	if (kvm_hlt_in_guest(vmx->vcpu.kvm))
 		exec_control &= ~CPU_BASED_HLT_EXITING;
+
+	/* splittlb: Force INVLPG exiting even when EPT is enabled to track unmaps */
+	if (enable_ept && vmx->vcpu.kvm->splitpages)
+		exec_control |= CPU_BASED_INVLPG_EXITING;
+
 	return exec_control;
 }
 
@@ -5149,6 +5154,7 @@ static int handle_ept_violation(struct kvm_vcpu *vcpu)
 	gpa_t gpa;
 	u64 error_code;
 	int splitresult;
+	int is_split_handled;
 
 	exit_qualification = vmcs_readl(EXIT_QUALIFICATION);
 
@@ -5185,18 +5191,21 @@ static int handle_ept_violation(struct kvm_vcpu *vcpu)
 	       PFERR_GUEST_FINAL_MASK : PFERR_GUEST_PAGE_MASK;
 
 	vcpu->arch.exit_qualification = exit_qualification;
-	if (split_tlb_handle_ept_violation(vcpu,gpa,exit_qualification,&splitresult)) {
-		if (vcpu->split_pervcpu.mtf_active) {
-			//printk_ratelimited(KERN_INFO "vmx: Setting MTF hardware bit for vCPU %d\n", vcpu->vcpu_id);
-			exec_controls_setbit(to_vmx(vcpu), CPU_BASED_MONITOR_TRAP_FLAG);
-		}
+	is_split_handled = split_tlb_handle_ept_violation(vcpu,gpa,exit_qualification,&splitresult);
 
+	if (vcpu->split_pervcpu.mtf_active) {
+		//printk_ratelimited(KERN_INFO "vmx: Setting MTF hardware bit for vCPU %d\n", vcpu->vcpu_id);
+		exec_controls_setbit(to_vmx(vcpu), CPU_BASED_MONITOR_TRAP_FLAG);
+	}
+
+	if (is_split_handled) {
 		if (splitresult == 0) {
-				printk_once(KERN_WARNING "handle_ept_violation: returning 0!\n");
+			printk_once(KERN_WARNING "handle_ept_violation: returning 0!\n");
 		}
 		return splitresult;
-	} else
+	} else {
 		return kvm_mmu_page_fault(vcpu, gpa, error_code, NULL, 0);
+	}
 }
 
 static int handle_ept_misconfig(struct kvm_vcpu *vcpu)

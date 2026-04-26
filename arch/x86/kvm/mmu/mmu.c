@@ -5607,6 +5607,8 @@ void kvm_mmu_invlpg(struct kvm_vcpu *vcpu, gva_t gva)
 	struct kvm_mmu *mmu = vcpu->arch.mmu;
 	int i;
 
+	split_tlb_invlpg(vcpu, gva);
+
 	/* INVLPG on a * non-canonical address is a NOP according to the SDM.  */
 	if (is_noncanonical_address(gva, vcpu))
 		return;

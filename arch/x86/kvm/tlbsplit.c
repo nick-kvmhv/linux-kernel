@@ -117,8 +117,11 @@ void split_tlb_unprotect_pte(struct kvm *kvm, struct kvm_splitpage *page)
 {
 	struct kvm_memory_slot *slot;
 
-	if (!page->pte_tracking_active)
+	spin_lock(&kvm->splitpages->track_lock);
+	if (!page->pte_tracking_active) {
+		spin_unlock(&kvm->splitpages->track_lock);
 		return;
+	}
 
 	slot = gfn_to_memslot(kvm, page->pte_gfn);
 	if (slot) {
@@ -127,6 +130,7 @@ void split_tlb_unprotect_pte(struct kvm *kvm, struct kvm_splitpage *page)
 	}
 
 	page->pte_tracking_active = false;
+	spin_unlock(&kvm->splitpages->track_lock);
 }
 
 void split_tlb_protect_pte(struct kvm_vcpu *vcpu, struct kvm_splitpage *page, gpa_t pte_gpa)
@@ -134,12 +138,17 @@ void split_tlb_protect_pte(struct kvm_vcpu *vcpu, struct kvm_splitpage *page, gp
 	struct kvm_memory_slot *slot;
 	gfn_t pte_gfn = pte_gpa >> PAGE_SHIFT;
 
-	if (page->pte_tracking_active)
+	spin_lock(&vcpu->kvm->splitpages->track_lock);
+	if (page->pte_tracking_active) {
+		spin_unlock(&vcpu->kvm->splitpages->track_lock);
 		return;
+	}
 
 	slot = kvm_vcpu_gfn_to_memslot(vcpu, pte_gfn);
-	if (!slot)
+	if (!slot) {
+		spin_unlock(&vcpu->kvm->splitpages->track_lock);
 		return;
+	}
 
 	page->pte_gpa = pte_gpa;
 	page->pte_gfn = pte_gfn;
@@ -147,6 +156,7 @@ void split_tlb_protect_pte(struct kvm_vcpu *vcpu, struct kvm_splitpage *page, gp
 
 	kvm_slot_page_track_add_page(vcpu->kvm, slot, pte_gfn, KVM_PAGE_TRACK_WRITE);
 	//printk(KERN_INFO "split_tlb: PTE write-protection activated for PTE GPA: 0x%llx\n", pte_gpa);
+	spin_unlock(&vcpu->kvm->splitpages->track_lock);
 }
 EXPORT_SYMBOL_GPL(split_tlb_protect_pte);
 
@@ -154,6 +164,7 @@ bool tlb_split_init(struct kvm *kvm) {
 	kvm->splitpages = kzalloc(sizeof(struct kvm_splitpages), GFP_KERNEL);
 	if (kvm->splitpages!=NULL) {
 		kvm->splitpages->vmcounter = next_vm++;
+		spin_lock_init(&kvm->splitpages->track_lock);
 		return true;
 	}
 	else
@@ -170,6 +181,7 @@ void kvm_split_tlb_freepage(struct kvm *kvm, struct kvm_splitpage *page)
 	page->active = 0;
 	page->gva = 0;
 	page->codeaddr = 0;
+	page->mtf_exits = 0;
 	page->dataaddrphys = 0;
 	if (page->dataaddr) {
 		kfree(page->dataaddr);
@@ -373,7 +385,10 @@ int split_tlb_activatepage(struct kvm_vcpu *vcpu, gva_t gva, ulong cr3) {
 	if (result) {
 		gpa_t pte_gpa = get_guest_pte_gpa(vcpu, cr3, gva);
 		if (pte_gpa) {
-			split_tlb_protect_pte(vcpu, page, pte_gpa);
+			/* Hybrid Approach: Record coordinates but leave EPT shield OFF */
+			page->pte_gpa = pte_gpa;
+			page->pte_gfn = pte_gpa >> PAGE_SHIFT;
+			page->pte_tracking_active = false;
 		} else {
 			printk(KERN_WARNING "split_tlb: Failed to find guest PTE GPA for GVA: 0x%lx, PTE tracking NOT activated!\n", gva);
 		}
@@ -1172,6 +1187,36 @@ int split_tlb_has_split_page(struct kvm *kvms, u64* sptep) {
 	return 0;
 }
 
+void split_tlb_invlpg(struct kvm_vcpu *vcpu, gva_t gva)
+{
+	struct kvm_splitpages *spages = vcpu->kvm->splitpages;
+	u64 evaluated_pte;
+	int i;
+
+	if (!spages)
+		return;
+
+	for (i = 0; i < KVM_MAX_SPLIT_PAGES; i++) {
+		if (spages->pages[i].active && spages->pages[i].gva == (gva & PAGE_MASK)) {
+			if (spages->pages[i].pte_gpa == 0)
+				continue;
+
+			if (!kvm_read_guest(vcpu->kvm, spages->pages[i].pte_gpa, &evaluated_pte, sizeof(evaluated_pte))) {
+				if (!(evaluated_pte & 1ULL /* PT_PRESENT_MASK */)) {
+					printk(KERN_INFO "split_tlb: Hook suspended via INVLPG (Page unmapped). Arming EPT tripwire!\n");
+					spages->pages[i].active = false;
+					split_tlb_restore_spte(vcpu, spages->pages[i].gpa >> PAGE_SHIFT, &spages->pages[i]);
+					spages->pages[i].gpa = 0;
+					
+					/* Turn ON the EPT tripwire so we catch when it is re-mapped */
+					split_tlb_protect_pte(vcpu, &spages->pages[i], spages->pages[i].pte_gpa);
+				}
+			}
+		}
+	}
+}
+EXPORT_SYMBOL_GPL(split_tlb_invlpg);
+
 int log_from_emulation = 0;
 void tlbsplit_emulation_log(char* format, ...) {
 	va_list args;
@@ -1201,6 +1246,11 @@ int split_tlb_handle_mtf(struct kvm_vcpu *vcpu)
 	for (i = 0; i < KVM_MAX_SPLIT_PAGES; i++) {
 		if (spages->pages[i].pte_gpa != 0 && spages->pages[i].pte_gfn == vcpu->split_pervcpu.mtf_pte_gfn) {
 			
+			spages->pages[i].mtf_exits++;
+			if ((spages->pages[i].mtf_exits % 10000) == 0) {
+				printk(KERN_INFO "split_tlb: %u MTF exits handled for PT at GPA 0x%llx\n", spages->pages[i].mtf_exits, spages->pages[i].pte_gpa);
+			}
+			
 			/* 1. Re-raise the EPT write-protection shield */
 			split_tlb_protect_pte(vcpu, &spages->pages[i], spages->pages[i].pte_gpa);
 			
@@ -1223,6 +1273,9 @@ int split_tlb_handle_mtf(struct kvm_vcpu *vcpu)
 						printk(KERN_INFO "split_tlb: Hook relocated to new GPA: 0x%llx via MTF natively\n", new_gpa);
 						spages->pages[i].gpa = new_gpa;
 					}
+					
+					/* The page is back in RAM. Drop the EPT shield for native performance! */
+					split_tlb_unprotect_pte(vcpu->kvm, &spages->pages[i]);
 				}
 			} else {
 				printk(KERN_ERR "split_tlb: MTF handler failed to read guest PTE\n");
@@ -1244,7 +1297,7 @@ int split_tlb_handle_ept_violation(struct kvm_vcpu *vcpu,gpa_t gpa,unsigned long
 	if (spages) {
 		bool mtf_armed = false;
 		for (i = 0; i < KVM_MAX_SPLIT_PAGES; i++) {
-			if (spages->pages[i].pte_tracking_active &&
+			if (spages->pages[i].pte_gpa != 0 &&
 			    (gpa >> PAGE_SHIFT) == spages->pages[i].pte_gfn) {
 				
 				/* 
@@ -1267,8 +1320,11 @@ int split_tlb_handle_ept_violation(struct kvm_vcpu *vcpu,gpa_t gpa,unsigned long
 			}
 		}
 		if (mtf_armed) {
-			*splitresult = 1;
-			return 1; /* Instantly resume guest to execute natively! */
+			/* 
+			 * Return 0 (false) to let KVM's mmu_page_fault run.
+			 * Since we just removed the page track, KVM will make the EPT writable.
+			 */
+			return 0;
 		}
 	}
 

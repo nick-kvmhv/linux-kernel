@@ -43,6 +43,7 @@ struct kvm_splitpage {
 		gpa_t pte_gpa;
 		gfn_t pte_gfn;
 		bool pte_tracking_active;
+		u32 mtf_exits;
 };
 
 struct kvm_splitpages {
@@ -52,6 +53,7 @@ struct kvm_splitpages {
 	gva_t adjust_from;
 	gva_t adjust_to;
 	u64 adjust_by;
+	spinlock_t track_lock;
 };
 
 
@@ -63,6 +65,7 @@ void split_shutdown_debugfs(void);
 
 struct kvm_splitpage* split_tlb_findpage(struct kvm *kvms,gpa_t gpa);
 int split_tlb_activatepage(struct kvm_vcpu *vcpu, gva_t gva, ulong cr3);
+void split_tlb_invlpg(struct kvm_vcpu *vcpu, gva_t gva);
 int split_tlb_setdatapage(struct kvm_vcpu *vcpu, gva_t gva, gva_t datagva, ulong cr3);
 int split_tlb_flip_page(struct kvm_vcpu *vcpu, gpa_t gpa, struct kvm_splitpage* splitpage, unsigned long exit_qualification);
 int split_tlb_freepage(struct kvm_vcpu *vcpu, gva_t gva);
