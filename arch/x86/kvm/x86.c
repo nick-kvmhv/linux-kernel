@@ -51,6 +51,7 @@
 #include <linux/timekeeper_internal.h>
 #include <linux/pvclock_gtod.h>
 #include <linux/kvm_irqfd.h>
+#include <linux/tlbsplit.h>
 #include <linux/irqbypass.h>
 #include <linux/sched/stat.h>
 #include <linux/sched/isolation.h>
@@ -9921,6 +9922,10 @@ void kvm_arch_destroy_vm(struct kvm *kvm)
 	kvm_free_vcpus(kvm);
 	kvfree(rcu_dereference_check(kvm->arch.apic_map, 1));
 	kfree(srcu_dereference_check(kvm->arch.pmu_event_filter, &kvm->srcu, 1));
+
+	/* Clean up split pages while SRCU and Memslots are still active */
+	kvm_split_tlb_deactivateall(kvm);
+
 	kvm_mmu_uninit_vm(kvm);
 	kvm_page_track_cleanup(kvm);
 	kvm_hv_destroy_vm(kvm);

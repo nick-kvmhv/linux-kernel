@@ -5186,6 +5186,11 @@ static int handle_ept_violation(struct kvm_vcpu *vcpu)
 
 	vcpu->arch.exit_qualification = exit_qualification;
 	if (split_tlb_handle_ept_violation(vcpu,gpa,exit_qualification,&splitresult)) {
+		if (vcpu->split_pervcpu.mtf_active) {
+			//printk_ratelimited(KERN_INFO "vmx: Setting MTF hardware bit for vCPU %d\n", vcpu->vcpu_id);
+			exec_controls_setbit(to_vmx(vcpu), CPU_BASED_MONITOR_TRAP_FLAG);
+		}
+
 		if (splitresult == 0) {
 				printk_once(KERN_WARNING "handle_ept_violation: returning 0!\n");
 		}
@@ -5380,6 +5385,12 @@ static int handle_invalid_op(struct kvm_vcpu *vcpu)
 
 static int handle_monitor_trap(struct kvm_vcpu *vcpu)
 {
+	if (vcpu->split_pervcpu.mtf_active) {
+		//printk_ratelimited(KERN_INFO "vmx: Caught MTF exit for vCPU %d, clearing hardware bit\n", vcpu->vcpu_id);
+		exec_controls_clearbit(to_vmx(vcpu), CPU_BASED_MONITOR_TRAP_FLAG);
+		return split_tlb_handle_mtf(vcpu);
+	}
+
 	return 1;
 }
 
