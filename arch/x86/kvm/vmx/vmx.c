@@ -5467,6 +5467,8 @@ static int handle_invpcid(struct kvm_vcpu *vcpu)
 		return kvm_skip_emulated_instruction(vcpu);
 
 	case INVPCID_TYPE_SINGLE_CTXT:
+		split_tlb_flush_all(vcpu);
+
 		if (!pcid_enabled && (operand.pcid != 0)) {
 			kvm_inject_gp(vcpu, 0);
 			return 1;
@@ -5501,6 +5503,8 @@ static int handle_invpcid(struct kvm_vcpu *vcpu)
 
 		/* fall-through */
 	case INVPCID_TYPE_ALL_INCL_GLOBAL:
+		split_tlb_flush_all(vcpu);
+
 		kvm_mmu_unload(vcpu);
 		return kvm_skip_emulated_instruction(vcpu);
 

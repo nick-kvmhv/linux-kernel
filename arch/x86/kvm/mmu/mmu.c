@@ -2724,9 +2724,9 @@ static bool mmu_page_zap_pte(struct kvm *kvm, struct kvm_mmu_page *sp,
 	u64 pte;
 	struct kvm_mmu_page *child;
 
-	if (COULD_BE_SPLIT_PAGE(*spte)&&split_tlb_has_split_page(kvm,spte)) {
-		printk(KERN_WARNING "mmu_page_zap_pte: zapping split page, restored it to 0x%llx vm:%x\n", *spte,kvm->splitpages->vmcounter);
-		WARN_ON(1);
+	if (COULD_BE_SPLIT_PAGE(*spte) && split_tlb_has_split_page(kvm, spte)) {
+		printk(KERN_INFO "mmu_page_zap_pte: zapping split page, restored it to 0x%llx vm:%x\n",
+		       *spte, kvm->splitpages->vmcounter);
 	}
 
 	pte = *spte;
@@ -3141,7 +3141,6 @@ static int set_spte(struct kvm_vcpu *vcpu, u64 *sptep,
 set_pte:
 	if (page&&page->active) {
 		printk(KERN_WARNING "set_spte: adjusting spte to no permissions and saving it on the page descriptor :0x%llx vm:%x\n",spte, vcpu->kvm->splitpages->vmcounter);
-		WARN_ON(1);
 		page->original_spte = spte;
 		spte&=~(VMX_EPT_WRITABLE_MASK|VMX_EPT_READABLE_MASK|VMX_EPT_EXECUTABLE_MASK);
 	}
@@ -5640,6 +5639,8 @@ void kvm_mmu_invpcid_gva(struct kvm_vcpu *vcpu, gva_t gva, unsigned long pcid)
 	struct kvm_mmu *mmu = vcpu->arch.mmu;
 	bool tlb_flush = false;
 	uint i;
+
+	split_tlb_invlpg(vcpu, gva);
 
 	if (pcid == kvm_get_active_pcid(vcpu)) {
 		mmu->invlpg(vcpu, gva, mmu->root_hpa);

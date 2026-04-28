@@ -66,6 +66,7 @@ void split_shutdown_debugfs(void);
 struct kvm_splitpage* split_tlb_findpage(struct kvm *kvms,gpa_t gpa);
 int split_tlb_activatepage(struct kvm_vcpu *vcpu, gva_t gva, ulong cr3);
 void split_tlb_invlpg(struct kvm_vcpu *vcpu, gva_t gva);
+void split_tlb_flush_all(struct kvm_vcpu *vcpu);
 int split_tlb_setdatapage(struct kvm_vcpu *vcpu, gva_t gva, gva_t datagva, ulong cr3);
 int split_tlb_flip_page(struct kvm_vcpu *vcpu, gpa_t gpa, struct kvm_splitpage* splitpage, unsigned long exit_qualification);
 int split_tlb_freepage(struct kvm_vcpu *vcpu, gva_t gva);

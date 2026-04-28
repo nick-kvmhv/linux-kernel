@@ -1000,6 +1000,8 @@ int kvm_set_cr3(struct kvm_vcpu *vcpu, unsigned long cr3)
 #ifdef CONFIG_X86_64
 	bool pcid_enabled = kvm_read_cr4_bits(vcpu, X86_CR4_PCIDE);
 
+	split_tlb_flush_all(vcpu);
+
 	if (pcid_enabled) {
 		skip_tlb_flush = cr3 & X86_CR3_PCID_NOFLUSH;
 		cr3 &= ~X86_CR3_PCID_NOFLUSH;

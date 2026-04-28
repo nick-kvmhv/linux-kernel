@@ -24,6 +24,11 @@
 
 #include "winntstruct.h"
 
+extern void kvm_mmu_gfn_disallow_lpage(struct kvm_memory_slot *slot, gfn_t gfn);
+extern void kvm_mmu_gfn_allow_lpage(struct kvm_memory_slot *slot, gfn_t gfn);
+
+static void split_tlb_allow_thp(struct kvm *kvm, gpa_t gpa);
+static void split_tlb_shatter_thp(struct kvm_vcpu *vcpu, gpa_t gpa);
 
 static int tlbsplit_buffer_size = 0x200 ;
 module_param(tlbsplit_buffer_size, int, 0);
@@ -174,6 +179,9 @@ bool tlb_split_init(struct kvm *kvm) {
 void kvm_split_tlb_freepage(struct kvm *kvm, struct kvm_splitpage *page)
 {
 	split_tlb_unprotect_pte(kvm, page);
+	/* Drop the THP restriction if this page was ever activated */
+	if (page->gpa != 0)
+		split_tlb_allow_thp(kvm, page->gpa);
 	page->cr3 = 0;
 	page->pte_gpa = 0;
 	page->pte_gfn = 0;
@@ -283,6 +291,7 @@ int split_tlb_setdatapage(struct kvm_vcpu *vcpu, gva_t gva, gva_t datagva, ulong
 		page->cr3 = cr3;
 		page->gpa = gpa&PAGE_MASK;
 		page->gva = gva&PAGE_MASK;
+		split_tlb_shatter_thp(vcpu, page->gpa);
 		page->dataaddr = kmalloc(4096,GFP_KERNEL);
 		page->dataaddrphys = virt_to_phys(page->dataaddr);
 		page->codepage = kmalloc(4096,GFP_KERNEL);
@@ -309,9 +318,52 @@ int split_tlb_findspte_callback(u64* sptep, int level, int last, int large) {
 	return (last && !large);
 }
 
+int split_tlb_findspte_large_callback(u64* sptep, int level, int last, int large) {
+	return (last && large);
+}
+
 int split_tlb_findspte_callback_print(u64* sptep, int level, int last, int large) {
 	printk(KERN_WARNING "split_tlb_findspte: sptep 0x%llx level:%d large=%d last=%d \n",*sptep,level,large,last);
 	return (last && !large);
+}
+
+static void split_tlb_allow_thp(struct kvm *kvm, gpa_t gpa)
+{
+	struct kvm_memory_slot *slot;
+	if (!gpa)
+		return;
+	slot = gfn_to_memslot(kvm, gpa >> PAGE_SHIFT);
+	if (slot) {
+		spin_lock(&kvm->mmu_lock);
+		kvm_mmu_gfn_allow_lpage(slot, gpa >> PAGE_SHIFT);
+		spin_unlock(&kvm->mmu_lock);
+	}
+}
+
+static void split_tlb_shatter_thp(struct kvm_vcpu *vcpu, gpa_t gpa)
+{
+	gfn_t gfn = gpa >> PAGE_SHIFT;
+	u64 *sptep;
+	struct kvm_memory_slot *slot = kvm_vcpu_gfn_to_memslot(vcpu, gfn);
+
+	if (!gpa)
+		return;
+
+	if (!slot)
+		return;
+
+	spin_lock(&vcpu->kvm->mmu_lock);
+	/* 1. Unconditionally prevent KVM from using large pages for this 2MB range */
+	kvm_mmu_gfn_disallow_lpage(slot, gfn);
+	/* 2. Check if it is currently mapped as a large page */
+	sptep = split_tlb_findspte(vcpu, gfn, split_tlb_findspte_large_callback);
+	spin_unlock(&vcpu->kvm->mmu_lock);
+		/* 3. If it is actively mapped as large, zap and rebuild it */
+	if (sptep != NULL) {
+		printk(KERN_INFO "split_tlb: Shattering active THP 2MB page at GPA 0x%llx\n", gpa);
+		kvm_zap_gfn_range(vcpu->kvm, gfn, gfn + 1);
+		kvm_mmu_page_fault(vcpu, gpa, 0, NULL, 0);
+	}
 }
 
 static gpa_t get_guest_pte_gpa(struct kvm_vcpu *vcpu, unsigned long cr3, gva_t gva) {
@@ -328,8 +380,11 @@ static gpa_t get_guest_pte_gpa(struct kvm_vcpu *vcpu, unsigned long cr3, gva_t g
 			return 0;
 		if (!(pte & 1ULL)) /* Not present */
 			return 0;
-		if (level > 1 && (pte & (1ULL << 7))) /* Large page */
+		if (level > 1 && (pte & (1ULL << 7))) { /* Large page */
+			printk_ratelimited(KERN_INFO "split_tlb: Guest is using %s Large Page for GVA 0x%lx!\n",
+					   level == 3 ? "1GB" : "2MB", gva);
 			return pte_gpa;
+		}
 		table_gpa = pte & PT64_BASE_ADDR_MASK;
 	}
 	return pte_gpa;
@@ -358,11 +413,14 @@ int split_tlb_activatepage(struct kvm_vcpu *vcpu, gva_t gva, ulong cr3) {
 	}
 	printk(KERN_INFO "split_tlb_activatepage found page cr3:0x%lx gva:0x%lx gpa:0x%llx page_gpa:0x%llx\n",cr3,gva,gpa,page->gpa);
 	if (page->gpa != (gpa&PAGE_MASK) ) {
+		split_tlb_allow_thp(vcpu->kvm, page->gpa);
 		printk(KERN_WARNING "split:tlb_activatepage gpa changed 0x%llx->0x%llx, adjusting\n",page->gpa,gpa&PAGE_MASK);
 		page->gpa = gpa&PAGE_MASK;
+		split_tlb_shatter_thp(vcpu, page->gpa);
 	}
 
 	gfn = gpa >> PAGE_SHIFT;
+
 	spin_lock(&vcpu->kvm->mmu_lock);
 	sptep = split_tlb_findspte(vcpu,gfn,split_tlb_findspte_callback);
 	if (sptep!=NULL) {
@@ -386,6 +444,7 @@ int split_tlb_activatepage(struct kvm_vcpu *vcpu, gva_t gva, ulong cr3) {
 		gpa_t pte_gpa = get_guest_pte_gpa(vcpu, cr3, gva);
 		if (pte_gpa) {
 			/* Hybrid Approach: Record coordinates but leave EPT shield OFF */
+			split_tlb_unprotect_pte(vcpu->kvm, page);
 			page->pte_gpa = pte_gpa;
 			page->pte_gfn = pte_gpa >> PAGE_SHIFT;
 			page->pte_tracking_active = false;
@@ -820,9 +879,39 @@ int split_tlb_flip_page(struct kvm_vcpu *vcpu, gpa_t gpa, struct kvm_splitpage* 
 		splitpage->codeaddr = codeaddrphys;
 	}	
 
+	/* --- LAZY EVICTION: Check if OS recycled the page BEFORE serving any access --- */
+	if (splitpage->active) {
+		u64 evaluated_pte = 0;
+		bool page_recycled = false;
+
+		if (splitpage->pte_gpa != 0 &&
+		    !kvm_read_guest(vcpu->kvm, splitpage->pte_gpa, &evaluated_pte, sizeof(evaluated_pte))) {
+			if (!(evaluated_pte & 1ULL) ||
+			    (evaluated_pte & PT64_BASE_ADDR_MASK) != (splitpage->gpa & PT64_BASE_ADDR_MASK)) {
+				page_recycled = true;
+			}
+		}
+
+		if (page_recycled) {
+			printk(KERN_INFO "split_tlb_flip_page: Physical page 0x%llx recycled by OS. Suspending hook.\n", gpa);
+			if (split_tlb_restore_spte(vcpu, gfn, splitpage) == 0)
+				return 0;
+			splitpage->active = false;
+			split_tlb_allow_thp(vcpu->kvm, splitpage->gpa);
+			splitpage->gpa = 0;
+			split_tlb_protect_pte(vcpu, splitpage, splitpage->pte_gpa);
+			return 1; /* Hardware will retry and use the restored SPTE natively */
+		}
+	}
+
+	if (!splitpage->active) {
+		printk(KERN_INFO "split_tlb_flip_page: EPT fault on inactive page 0x%llx. Falling back to KVM.\n", gpa);
+		return 0;
+	}
+
 	if (exit_qualification & PTE_WRITE) //write
 	{
-		printk(KERN_WARNING "split_tlb_flip_page: WRITE EPT fault at 0x%llx. detourpa:0x%llx rip:0x%lx vcpuid:%d Removing the page\n",gpa,dataaddrphys,rip,vcpu->vcpu_id);
+		printk(KERN_WARNING "split_tlb_flip_page: Malicious WRITE EPT fault at 0x%llx. detourpa:0x%llx rip:0x%lx vcpuid:%d Removing the page\n",gpa,dataaddrphys,rip,vcpu->vcpu_id);
 		if (split_tlb_restore_spte(vcpu,gfn,splitpage)==0) {
 			return 0;
 		}
@@ -833,11 +922,6 @@ int split_tlb_flip_page(struct kvm_vcpu *vcpu, gpa_t gpa, struct kvm_splitpage* 
 		u64* sptep;
 		log_read_flip(vcpu,rip);
 		spin_lock(&vcpu->kvm->mmu_lock);
-		if (!splitpage->active) {
-		    printk(KERN_WARNING "split_tlb_flip_page: READ EPT page became inactive 0x%llx, falling back\n",gpa);
-			spin_unlock(&vcpu->kvm->mmu_lock);
-		    return 0;
-		}
 		sptep = split_tlb_findspte(vcpu,gfn,split_tlb_findspte_callback);
 		if (exit_qualification & PTE_EXECUTE) //TODO handle execute&read, not sure if needed
 			{
@@ -882,11 +966,6 @@ int split_tlb_flip_page(struct kvm_vcpu *vcpu, gpa_t gpa, struct kvm_splitpage* 
 	{
 		u64* sptep;
 		spin_lock(&vcpu->kvm->mmu_lock);
-		if (!splitpage->active) {
-		    printk(KERN_WARNING "split_tlb_flip_page: EXEC EPT page became inactive 0x%llx, falling back\n",gpa);
-			spin_unlock(&vcpu->kvm->mmu_lock);
-		    return 0;
-		}
 		sptep = split_tlb_findspte(vcpu,gfn,split_tlb_findspte_callback);
 		if (sptep!=NULL) {
 			u64 newspte = *sptep;
@@ -952,7 +1031,7 @@ int deactivateAllPages(struct kvm_vcpu *vcpu) {
 	return 1;
 }
 
-int isPageSplit(struct kvm_vcpu *vcpu, gva_t addr ) {
+int isPageSplit(struct kvm_vcpu *vcpu, gva_t addr, ulong cr3) {
 	u32 access = (kvm_x86_ops.get_cpl(vcpu) == 3) ? PFERR_USER_MASK : 0;
 	struct kvm_splitpage* page;
 	struct x86_exception exception;
@@ -961,11 +1040,15 @@ int isPageSplit(struct kvm_vcpu *vcpu, gva_t addr ) {
 		printk(KERN_WARNING "isPageSplit: address unmapped gva=%lx\n",addr);
 		return 0;
 	}
-//	printk(KERN_WARNING "isPageSplit: address translated gva=%lx to gpa=0x%llx\n",addr,addr_gpa);
-	page = split_tlb_findpage(vcpu->kvm,addr_gpa);
-	if (page != NULL)
+	page = split_tlb_findpage_gva_cr3(vcpu->kvm, addr, cr3);
+	if (page != NULL) {
+		if (page->gpa != (addr_gpa & PAGE_MASK) || !page->active) {
+			printk(KERN_INFO "isPageSplit: auto-healing gva=%lx (old gpa=0x%llx, new gpa=0x%llx, active=%d)\n", 
+			       addr, page->gpa, addr_gpa & PAGE_MASK, page->active);
+			split_tlb_activatepage(vcpu, addr, cr3);
+		}
 		return 1;
-	else {
+	} else {
 		printk(KERN_WARNING "isPageSplit: no split page for gva=%lx to gpa=0x%llx\n",addr,addr_gpa);
 		return 0;
 	}
@@ -1109,7 +1192,7 @@ int split_tlb_vmcall_dispatch(struct kvm_vcpu *vcpu)
 			result = deactivateAllPages(vcpu);
 			break;
 		case 0x0005:
-			result = isPageSplit(vcpu,rbx);
+			result = isPageSplit(vcpu,rbx,cr3);
 			break;
 		case 0x0006:
 			result = split_tlb_copymem(vcpu,rbx,rsi,r8,cr3);
@@ -1171,13 +1254,16 @@ int split_tlb_has_split_page(struct kvm *kvms, u64* sptep) {
 		found = kvms->splitpages->pages+i;
 		if (found->active) {
 			//phys_addr_t detouraddr = virt_to_phys(found->dataaddr);
-			printk(KERN_WARNING "split_tlb_has_split_page: comparing pagehpa:0x%llx with code/data hpa:0x%llx/0x%llx\n",pagehpa,found->codeaddr,found->dataaddrphys);
+			//printk(KERN_WARNING "split_tlb_has_split_page: comparing pagehpa:0x%llx with code/data hpa:0x%llx/0x%llx\n",pagehpa,found->codeaddr,found->dataaddrphys);
 			if (pagehpa == found->codeaddr || pagehpa == found->dataaddrphys) {
 				if (found->original_spte & PT64_BASE_ADDR_MASK)
 				    *sptep = found->original_spte;
 				else
 				    *sptep = 0; //found->original_spte;
 				printk(KERN_WARNING "split_tlb_has_split_page: found page gva:0x%lx VM:%x resetting to 0x%llx\n",found->gva,kvms->splitpages->vmcounter,*sptep);
+
+				/* Force re-activation so we capture a potentially new Host PFN */
+				found->active = false;
 				//split_tlb_flip_to_code(kvms,found->codeaddr,sptep);
 				return 1;
 			}
@@ -1204,8 +1290,9 @@ void split_tlb_invlpg(struct kvm_vcpu *vcpu, gva_t gva)
 			if (!kvm_read_guest(vcpu->kvm, spages->pages[i].pte_gpa, &evaluated_pte, sizeof(evaluated_pte))) {
 				if (!(evaluated_pte & 1ULL /* PT_PRESENT_MASK */)) {
 					printk(KERN_INFO "split_tlb: Hook suspended via INVLPG (Page unmapped). Arming EPT tripwire!\n");
-					spages->pages[i].active = false;
 					split_tlb_restore_spte(vcpu, spages->pages[i].gpa >> PAGE_SHIFT, &spages->pages[i]);
+					spages->pages[i].active = false;
+					split_tlb_allow_thp(vcpu->kvm, spages->pages[i].gpa);
 					spages->pages[i].gpa = 0;
 					
 					/* Turn ON the EPT tripwire so we catch when it is re-mapped */
@@ -1216,6 +1303,33 @@ void split_tlb_invlpg(struct kvm_vcpu *vcpu, gva_t gva)
 	}
 }
 EXPORT_SYMBOL_GPL(split_tlb_invlpg);
+
+void split_tlb_flush_all(struct kvm_vcpu *vcpu)
+{
+	struct kvm_splitpages *spages = vcpu->kvm->splitpages;
+	u64 evaluated_pte;
+	int i;
+
+	if (!spages)
+		return;
+
+	for (i = 0; i < KVM_MAX_SPLIT_PAGES; i++) {
+		if (spages->pages[i].active && spages->pages[i].pte_gpa != 0) {
+			if (!kvm_read_guest(vcpu->kvm, spages->pages[i].pte_gpa, &evaluated_pte, sizeof(evaluated_pte))) {
+				if (!(evaluated_pte & 1ULL /* PT_PRESENT_MASK */) ||
+				    (evaluated_pte & PT64_BASE_ADDR_MASK) != (spages->pages[i].gpa & PT64_BASE_ADDR_MASK)) {
+					printk(KERN_INFO "split_tlb: Hook suspended via Bulk Flush (CR3/INVPCID). Arming EPT tripwire!\n");
+					split_tlb_restore_spte(vcpu, spages->pages[i].gpa >> PAGE_SHIFT, &spages->pages[i]);
+					spages->pages[i].active = false;
+					split_tlb_allow_thp(vcpu->kvm, spages->pages[i].gpa);
+					spages->pages[i].gpa = 0;
+					split_tlb_protect_pte(vcpu, &spages->pages[i], spages->pages[i].pte_gpa);
+				}
+			}
+		}
+	}
+}
+EXPORT_SYMBOL_GPL(split_tlb_flush_all);
 
 int log_from_emulation = 0;
 void tlbsplit_emulation_log(char* format, ...) {
@@ -1247,20 +1361,21 @@ int split_tlb_handle_mtf(struct kvm_vcpu *vcpu)
 		if (spages->pages[i].pte_gpa != 0 && spages->pages[i].pte_gfn == vcpu->split_pervcpu.mtf_pte_gfn) {
 			
 			spages->pages[i].mtf_exits++;
-			if ((spages->pages[i].mtf_exits % 10000) == 0) {
+			if ((spages->pages[i].mtf_exits % 1000000) == 0) {
 				printk(KERN_INFO "split_tlb: %u MTF exits handled for PT at GPA 0x%llx\n", spages->pages[i].mtf_exits, spages->pages[i].pte_gpa);
 			}
 			
-			/* 1. Re-raise the EPT write-protection shield */
-			split_tlb_protect_pte(vcpu, &spages->pages[i], spages->pages[i].pte_gpa);
-			
-			/* 2. Check what the instruction actually did to the PTE */
+			/* 1. Check what the instruction actually did to the PTE */
 			if (!kvm_read_guest(vcpu->kvm, spages->pages[i].pte_gpa, &evaluated_pte, sizeof(evaluated_pte))) {
 				if (!(evaluated_pte & 1ULL /* PT_PRESENT_MASK */)) {
+					/* 2. Still unmapped! Re-raise the EPT write-protection shield */
+					split_tlb_protect_pte(vcpu, &spages->pages[i], spages->pages[i].pte_gpa);
+
 					if (spages->pages[i].active) {
 						printk(KERN_INFO "split_tlb: Hook suspended (Page unmapped via MTF natively).\n");
-						spages->pages[i].active = false;
 						split_tlb_restore_spte(vcpu, spages->pages[i].gpa >> PAGE_SHIFT, &spages->pages[i]);
+						spages->pages[i].active = false;
+						split_tlb_allow_thp(vcpu->kvm, spages->pages[i].gpa);
 						spages->pages[i].gpa = 0;
 					}
 				} else {
@@ -1269,9 +1384,12 @@ int split_tlb_handle_mtf(struct kvm_vcpu *vcpu)
 						printk(KERN_INFO "split_tlb: Hook reactivated at new GPA: 0x%llx via MTF\n", new_gpa);
 						spages->pages[i].gpa = new_gpa;
 						spages->pages[i].active = true;
+						split_tlb_shatter_thp(vcpu, new_gpa);
 					} else if (spages->pages[i].gpa != new_gpa) {
 						printk(KERN_INFO "split_tlb: Hook relocated to new GPA: 0x%llx via MTF natively\n", new_gpa);
+						split_tlb_allow_thp(vcpu->kvm, spages->pages[i].gpa);
 						spages->pages[i].gpa = new_gpa;
+						split_tlb_shatter_thp(vcpu, new_gpa);
 					}
 					
 					/* The page is back in RAM. Drop the EPT shield for native performance! */
@@ -1297,7 +1415,8 @@ int split_tlb_handle_ept_violation(struct kvm_vcpu *vcpu,gpa_t gpa,unsigned long
 	if (spages) {
 		bool mtf_armed = false;
 		for (i = 0; i < KVM_MAX_SPLIT_PAGES; i++) {
-			if (spages->pages[i].pte_gpa != 0 &&
+			if (spages->pages[i].pte_tracking_active &&
+			    spages->pages[i].pte_gpa != 0 &&
 			    (gpa >> PAGE_SHIFT) == spages->pages[i].pte_gfn) {
 				
 				/* 
