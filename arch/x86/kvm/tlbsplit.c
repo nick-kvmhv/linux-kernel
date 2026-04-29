@@ -1038,7 +1038,10 @@ int isPageSplit(struct kvm_vcpu *vcpu, gva_t addr, ulong cr3) {
 	}
 	page = split_tlb_findpage_gva_cr3(vcpu->kvm, addr, cr3);
 	if (page != NULL) {
-		if (page->gpa != (addr_gpa & PAGE_MASK) || !page->active) {
+		/* Heal guest-side GPA relocations, but ignore !active state.
+		 * Host-side zaps (which cause !active) are now handled by the
+		 * Double-Fault mechanism on the next hardware fault. */
+		if (page->gpa != (addr_gpa & PAGE_MASK)) {
 			printk(KERN_INFO "isPageSplit: auto-healing gva=%lx (old gpa=0x%llx, new gpa=0x%llx, active=%d)\n", 
 			       addr, page->gpa, addr_gpa & PAGE_MASK, page->active);
 			split_tlb_activatepage(vcpu, addr, cr3);
