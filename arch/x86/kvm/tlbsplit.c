@@ -418,6 +418,7 @@ int split_tlb_activatepage(struct kvm_vcpu *vcpu, gva_t gva, ulong cr3) {
 	gfn = gpa >> PAGE_SHIFT;
 
 	spin_lock(&vcpu->kvm->mmu_lock);
+	page->active = true;
 	sptep = split_tlb_findspte(vcpu,gfn,split_tlb_findspte_callback);
 	if (sptep!=NULL) {
 		u64 newspte = *sptep & ~(VMX_EPT_READABLE_MASK|VMX_EPT_WRITABLE_MASK);
@@ -427,12 +428,11 @@ int split_tlb_activatepage(struct kvm_vcpu *vcpu, gva_t gva, ulong cr3) {
 		//newspte = 0L;
 		printk(KERN_INFO "split_tlb_activatepage: spte=0x%llx->newspte=0x%llx ,sptep=x%llx\n",*sptep,newspte,(u64)sptep);
         	*sptep = newspte;
-        	page->active = true;
 		kvm_flush_remote_tlbs(vcpu->kvm);
 		result = 1;
 	} else {
-		printk(KERN_WARNING "split_tlb_activatepage: spte not found 0x%llx\n",gpa);
-		sptep = split_tlb_findspte(vcpu,gfn,split_tlb_findspte_callback_print);
+		printk(KERN_INFO "split_tlb_activatepage: spte not found 0x%llx, hook will arm on next access\n",gpa);
+		result = 1;
 	}
 	spin_unlock(&vcpu->kvm->mmu_lock);
 
@@ -1038,14 +1038,30 @@ int isPageSplit(struct kvm_vcpu *vcpu, gva_t addr, ulong cr3) {
 	}
 	page = split_tlb_findpage_gva_cr3(vcpu->kvm, addr, cr3);
 	if (page != NULL) {
-		/* Heal guest-side GPA relocations, but ignore !active state.
-		 * Host-side zaps (which cause !active) are now handled by the
-		 * Double-Fault mechanism on the next hardware fault. */
+		bool needs_healing = false;
+
 		if (page->gpa != (addr_gpa & PAGE_MASK)) {
-			printk(KERN_INFO "isPageSplit: auto-healing gva=%lx (old gpa=0x%llx, new gpa=0x%llx, active=%d)\n", 
+			printk(KERN_INFO "isPageSplit: auto-healing for GPA relocation gva=%lx (old gpa=0x%llx, new gpa=0x%llx, active=%d)\n",
 			       addr, page->gpa, addr_gpa & PAGE_MASK, page->active);
-			split_tlb_activatepage(vcpu, addr, cr3);
+			needs_healing = true;
+		} else {
+			u64 *sptep;
+			spin_lock(&vcpu->kvm->mmu_lock);
+			sptep = split_tlb_findspte(vcpu, addr_gpa >> PAGE_SHIFT, split_tlb_findspte_callback);
+			if (sptep) {
+				u64 spte = *sptep;
+				/* Check if it's a native, fully permissive mapping. */
+				if ((spte & (VMX_EPT_READABLE_MASK | VMX_EPT_WRITABLE_MASK | VMX_EPT_EXECUTABLE_MASK)) ==
+				    (VMX_EPT_READABLE_MASK | VMX_EPT_WRITABLE_MASK | VMX_EPT_EXECUTABLE_MASK)) {
+					printk(KERN_INFO "isPageSplit: auto-healing for bypassed EPT permissions on gva=%lx (native mapping found).\n", addr);
+					needs_healing = true;
+				}
+			}
+			spin_unlock(&vcpu->kvm->mmu_lock);
 		}
+
+		if (needs_healing)
+			split_tlb_activatepage(vcpu, addr, cr3);
 		return 1;
 	} else {
 		printk(KERN_WARNING "isPageSplit: no split page for gva=%lx to gpa=0x%llx\n",addr,addr_gpa);
