@@ -5,7 +5,6 @@
  *      Author: nick
  */
 
-#include <linux/extable.h>
 #include <linux/module.h>
 #include <linux/moduleparam.h>
 /*
@@ -16,6 +15,7 @@
 #include <linux/tlbsplit.h>
 #include <asm/vmx.h>
 #include <linux/debugfs.h>
+#include <linux/miscdevice.h>
 #include <linux/kvm_host.h>
 //#include <linux/gfp.h>
 #include <kvm_emulate.h>
@@ -24,8 +24,6 @@
 
 #include "winntstruct.h"
 
-extern void kvm_mmu_gfn_disallow_lpage(struct kvm_memory_slot *slot, gfn_t gfn);
-extern void kvm_mmu_gfn_allow_lpage(struct kvm_memory_slot *slot, gfn_t gfn);
 
 static void split_tlb_allow_thp(struct kvm *kvm, gpa_t gpa);
 static void split_tlb_shatter_thp(struct kvm_vcpu *vcpu, gpa_t gpa);
@@ -51,20 +49,8 @@ MODULE_PARM_DESC(tlbsplit_log_read_stacks, "Log up to 5 stack pages of read flip
 
 //#define KVM_MAX_TRACKER 0x200
 
-struct kvm_ept_violation_tracker_entry {
-	u32 counter;
-	u16 read;
-	u16 vmnumber;
-	u64 gva;
-	u64 rip;
-	u64 cr3;
-} __attribute__( ( packed ) ) ;
-
 atomic_t split_tracker_next_write;
-struct kvm_ept_violation_tracker {
-	int max_number_of_entries;
-	struct kvm_ept_violation_tracker_entry entries[];
-} __attribute__( ( packed ) ) *split_tracker;
+struct kvm_ept_violation_tracker *split_tracker;
 
 static struct dentry *split_dentry;
 
@@ -83,6 +69,13 @@ static const struct file_operations split_debug = {
         .read = split_counter_reader,
 };
 
+static struct miscdevice split_miscdev = {
+	.minor = MISC_DYNAMIC_MINOR,
+	.name = "tlb_split",
+	.fops = &split_debug,
+	.mode = 0444,
+};
+
 void split_init_debugfs(void) {
 	debug_buffer_size = sizeof(int) + sizeof(struct kvm_ept_violation_tracker_entry) * tlbsplit_buffer_size;
 	atomic_set(&split_tracker_next_write,0);
@@ -92,10 +85,12 @@ void split_init_debugfs(void) {
 	split_tracker->max_number_of_entries = tlbsplit_buffer_size;
 	split_dentry = debugfs_create_file("tlb_split", 0444, kvm_debugfs_dir, NULL, &split_debug);
 	printk(KERN_INFO "tlb_split_init:debugfs_create_file returned 0%lx allocated:0%ld for %d entries\n",(unsigned long)split_dentry,debug_buffer_size,tlbsplit_buffer_size);
+	
+	misc_register(&split_miscdev);
 	next_vm = 0;
 }
 
-void _register_ept_flip(gva_t gva,gva_t rip,unsigned long cr3,struct kvm *kvm,bool read) {
+static void split_tlb_register_ept_flip(gva_t gva, gva_t rip, unsigned long cr3, struct kvm *kvm, bool read) {
 	int vmnumber = kvm->splitpages->vmcounter;
 	int counter = atomic_inc_return(&split_tracker_next_write);
 	int nextRow = (counter - 1) % split_tracker->max_number_of_entries;
@@ -115,6 +110,7 @@ void _register_ept_flip(gva_t gva,gva_t rip,unsigned long cr3,struct kvm *kvm,bo
 
 void split_shutdown_debugfs(void) {
 	debugfs_remove(split_dentry);
+	misc_deregister(&split_miscdev);
 	kfree(split_tracker);
 }
 
@@ -217,7 +213,7 @@ void kvm_split_tlb_deactivateall(struct kvm *kvm) {
 }
 EXPORT_SYMBOL_GPL(kvm_split_tlb_deactivateall);
 
-static struct kvm_splitpage* _split_tlb_findpage(struct kvm *kvms,gpa_t gpa) {
+static struct kvm_splitpage* split_tlb_findpage_internal(struct kvm *kvms,gpa_t gpa) {
 	int i;
 	struct kvm_splitpage* found;
 	gpa_t pagestart;
@@ -238,7 +234,7 @@ static struct kvm_splitpage* _split_tlb_findpage(struct kvm *kvms,gpa_t gpa) {
 
 struct kvm_splitpage* split_tlb_findpage(struct kvm *kvms,gpa_t gpa) {
 	if (gpa&PAGE_MASK)
-		return _split_tlb_findpage(kvms,gpa);
+		return split_tlb_findpage_internal(kvms,gpa);
 	else
 		return NULL;
 }
@@ -283,7 +279,7 @@ int split_tlb_setdatapage(struct kvm_vcpu *vcpu, gva_t gva, gva_t datagva, ulong
 	else
 		page = split_tlb_findpage_gva_cr3(vcpu->kvm,gva,cr3);
 	if (page == NULL) {
-		page = _split_tlb_findpage(vcpu->kvm,0);
+		page = split_tlb_findpage_internal(vcpu->kvm,0);
 		if (page == NULL) {
 			printk(KERN_WARNING "No more slots in the split page table\n");
 			return 0;
@@ -905,7 +901,7 @@ int split_tlb_flip_page(struct kvm_vcpu *vcpu, gpa_t gpa, struct kvm_splitpage* 
 	}
 
 	if (!splitpage->active) {
-		printk(KERN_INFO "split_tlb_flip_page: EPT fault on inactive page 0x%llx. Falling back to KVM.\n", gpa);
+		printk(KERN_INFO "split_tlb_flip_page: EPT fault on inactive page 0x%llx (GVA: 0x%lx). Returning 0 for KVM Native Page-In & Double-Fault!\n", gpa, splitpage->gva);
 		return 0;
 	}
 
@@ -951,7 +947,7 @@ int split_tlb_flip_page(struct kvm_vcpu *vcpu, gpa_t gpa, struct kvm_splitpage* 
 			return 0;		
 		}
 		spin_unlock(&vcpu->kvm->mmu_lock);
-		_register_ept_flip(splitpage->gva,rip,cr3,vcpu->kvm,true);
+		split_tlb_register_ept_flip(splitpage->gva, rip, cr3, vcpu->kvm, true);
 		now_tick = jiffies;
 		vcpu->split_pervcpu.exec_when_last_read = vcpu->split_pervcpu.last_exec_count;
 		if ((rip == vcpu->split_pervcpu.last_read_rip) && (now_tick - vcpu->split_pervcpu.flip_tick) < HZ ) {
@@ -990,7 +986,7 @@ int split_tlb_flip_page(struct kvm_vcpu *vcpu, gpa_t gpa, struct kvm_splitpage* 
 			return 0;		
 		}
 		spin_unlock(&vcpu->kvm->mmu_lock);
-		_register_ept_flip(splitpage->gva,rip,cr3,vcpu->kvm,false);
+		split_tlb_register_ept_flip(splitpage->gva, rip, cr3, vcpu->kvm, false);
 		now_tick = jiffies;
 		vcpu->split_pervcpu.read_when_last_exec = vcpu->split_pervcpu.last_read_count;
 		if ( rip == vcpu->split_pervcpu.last_exec_rip && (now_tick - vcpu->split_pervcpu.flip_tick) < HZ) {
@@ -1273,33 +1269,71 @@ int split_tlb_has_split_page(struct kvm *kvms, u64* sptep) {
 	return 0;
 }
 
+static void split_tlb_evaluate_hook(struct kvm_vcpu *vcpu, int i)
+{
+	struct kvm_splitpages *spages = vcpu->kvm->splitpages;
+	gva_t gva = spages->pages[i].gva;
+	ulong cr3 = spages->pages[i].cr3;
+	gpa_t pte_gpa;
+	u64 evaluated_pte;
+	u64 exact_gpa;
+
+	if (gva == 0 || cr3 == 0)
+		return;
+
+	/* Proactively re-walk the hardware page tables to find the current physical mapping */
+	pte_gpa = get_guest_pte_gpa(vcpu, cr3, gva);
+
+	if (pte_gpa == 0 || kvm_read_guest(vcpu->kvm, pte_gpa, &evaluated_pte, sizeof(evaluated_pte)) || !(evaluated_pte & 1ULL)) {
+		if (spages->pages[i].active) {
+			printk(KERN_INFO "split_tlb: Hook suspended via Flush (Unmapped).\n");
+			split_tlb_restore_spte(vcpu, spages->pages[i].gpa >> PAGE_SHIFT, &spages->pages[i]);
+			spages->pages[i].active = false;
+			split_tlb_allow_thp(vcpu->kvm, spages->pages[i].gpa);
+			spages->pages[i].gpa = 0;
+
+			/* If we had a tripwire on the old page table, remove it since it's dead */
+			if (spages->pages[i].pte_tracking_active)
+				split_tlb_unprotect_pte(vcpu->kvm, &spages->pages[i]);
+		}
+		return;
+	}
+
+	/* The page is mapped in the OS. Calculate its exact physical address. */
+	exact_gpa = evaluated_pte & PT64_BASE_ADDR_MASK;
+
+	if (spages->pages[i].active) {
+		if (exact_gpa != spages->pages[i].gpa) {
+			printk(KERN_INFO "split_tlb: Hook relocated via Flush natively. Auto-healing to 0x%llx\n", exact_gpa);
+			split_tlb_allow_thp(vcpu->kvm, spages->pages[i].gpa);
+			spages->pages[i].gpa = exact_gpa;
+			split_tlb_shatter_thp(vcpu, exact_gpa);
+		}
+	} else {
+		printk(KERN_INFO "split_tlb: Suspended hook returned via Flush. Auto-healing to 0x%llx\n", exact_gpa);
+		spages->pages[i].gpa = exact_gpa;
+		spages->pages[i].active = true;
+		split_tlb_shatter_thp(vcpu, exact_gpa);
+	}
+
+	/* Always ensure the EPT tripwire is locked onto the correct Page Table */
+	if (pte_gpa != spages->pages[i].pte_gpa) {
+		split_tlb_unprotect_pte(vcpu->kvm, &spages->pages[i]);
+		split_tlb_protect_pte(vcpu, &spages->pages[i], pte_gpa);
+	}
+}
+
 void split_tlb_invlpg(struct kvm_vcpu *vcpu, gva_t gva)
 {
 	struct kvm_splitpages *spages = vcpu->kvm->splitpages;
-	u64 evaluated_pte;
 	int i;
 
 	if (!spages)
 		return;
 
 	for (i = 0; i < KVM_MAX_SPLIT_PAGES; i++) {
-		if (spages->pages[i].active && spages->pages[i].gva == (gva & PAGE_MASK)) {
-			if (spages->pages[i].pte_gpa == 0)
-				continue;
-
-			if (!kvm_read_guest(vcpu->kvm, spages->pages[i].pte_gpa, &evaluated_pte, sizeof(evaluated_pte))) {
-				if (!(evaluated_pte & 1ULL /* PT_PRESENT_MASK */)) {
-					printk(KERN_INFO "split_tlb: Hook suspended via INVLPG (Page unmapped). Arming EPT tripwire!\n");
-					split_tlb_restore_spte(vcpu, spages->pages[i].gpa >> PAGE_SHIFT, &spages->pages[i]);
-					spages->pages[i].active = false;
-					split_tlb_allow_thp(vcpu->kvm, spages->pages[i].gpa);
-					spages->pages[i].gpa = 0;
-					
-					/* Turn ON the EPT tripwire so we catch when it is re-mapped */
-					split_tlb_protect_pte(vcpu, &spages->pages[i], spages->pages[i].pte_gpa);
-				}
-			}
-		}
+		if (spages->pages[i].gva == (gva & PAGE_MASK))
+			split_tlb_evaluate_hook(vcpu, i);
 	}
 }
 EXPORT_SYMBOL_GPL(split_tlb_invlpg);
@@ -1307,26 +1341,14 @@ EXPORT_SYMBOL_GPL(split_tlb_invlpg);
 void split_tlb_flush_all(struct kvm_vcpu *vcpu)
 {
 	struct kvm_splitpages *spages = vcpu->kvm->splitpages;
-	u64 evaluated_pte;
 	int i;
 
 	if (!spages)
 		return;
 
 	for (i = 0; i < KVM_MAX_SPLIT_PAGES; i++) {
-		if (spages->pages[i].active && spages->pages[i].pte_gpa != 0) {
-			if (!kvm_read_guest(vcpu->kvm, spages->pages[i].pte_gpa, &evaluated_pte, sizeof(evaluated_pte))) {
-				if (!(evaluated_pte & 1ULL /* PT_PRESENT_MASK */) ||
-				    (evaluated_pte & PT64_BASE_ADDR_MASK) != (spages->pages[i].gpa & PT64_BASE_ADDR_MASK)) {
-					printk(KERN_INFO "split_tlb: Hook suspended via Bulk Flush (CR3/INVPCID). Arming EPT tripwire!\n");
-					split_tlb_restore_spte(vcpu, spages->pages[i].gpa >> PAGE_SHIFT, &spages->pages[i]);
-					spages->pages[i].active = false;
-					split_tlb_allow_thp(vcpu->kvm, spages->pages[i].gpa);
-					spages->pages[i].gpa = 0;
-					split_tlb_protect_pte(vcpu, &spages->pages[i], spages->pages[i].pte_gpa);
-				}
-			}
-		}
+		if (spages->pages[i].gva != 0)
+			split_tlb_evaluate_hook(vcpu, i);
 	}
 }
 EXPORT_SYMBOL_GPL(split_tlb_flush_all);
@@ -1527,7 +1549,7 @@ int split_tlb_handle_ept_violation(struct kvm_vcpu *vcpu,gpa_t gpa,unsigned long
 			}
 
 		} else {
-			printk(KERN_WARNING "handle_ept_violation split_tlb_flip_page returned 0 page: 0x%llx",gpa);
+			printk(KERN_WARNING "handle_ept_violation split_tlb_flip_page returned 0 page: 0x%llx (GVA: 0x%lx)\n", gpa, splitpage->gva);
 			return 0;
 		}
 		return 1;

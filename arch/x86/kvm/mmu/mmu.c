@@ -3139,10 +3139,16 @@ static int set_spte(struct kvm_vcpu *vcpu, u64 *sptep,
 		spte = mark_spte_for_access_track(spte);
 
 set_pte:
-	if (page&&page->active) {
-		printk(KERN_WARNING "set_spte: adjusting spte to no permissions and saving it on the page descriptor :0x%llx vm:%x\n",spte, vcpu->kvm->splitpages->vmcounter);
+	if (page) {
+		if (page->active) {
+			printk(KERN_INFO "set_spte: adjusting active spte to Read-Only and saving it on the page descriptor :0x%llx vm:%x\n",spte, vcpu->kvm->splitpages->vmcounter);
+		} else {
+			printk(KERN_INFO "set_spte: Zap recovery applying Double-Fault sabotage for GPA 0x%llx, native spte: 0x%llx vm:%x\n",
+			       (u64)(gfn << PAGE_SHIFT), spte, vcpu->kvm->splitpages->vmcounter);
+			page->active = true;
+		}
 		page->original_spte = spte;
-		spte&=~(VMX_EPT_WRITABLE_MASK|VMX_EPT_READABLE_MASK|VMX_EPT_EXECUTABLE_MASK);
+		spte &= ~(VMX_EPT_WRITABLE_MASK | VMX_EPT_EXECUTABLE_MASK); /* Leave READ intact! */
 	}
 	if (mmu_spte_update(sptep, spte))
 		ret |= SET_SPTE_NEED_REMOTE_TLB_FLUSH;

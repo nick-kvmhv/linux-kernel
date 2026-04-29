@@ -20,7 +20,6 @@ struct kvm_tlbsplit_pervcpu {
 	unsigned long flip_tick;
 	bool mtf_active;
 	u64 mtf_pte_gfn;
-	
 };
 
 #include <linux/kvm_host.h>
@@ -29,6 +28,20 @@ struct kvm_tlbsplit_pervcpu {
 #define KVM_MAX_SPLIT_PAGES 100
 #define MAX_PATCH_SIZE 1024
 #define KVM_SPLIT_PAGES_TRACKER_SIZE 0x10
+
+struct kvm_ept_violation_tracker_entry {
+	u32 counter;
+	u16 read;
+	u16 vmnumber;
+	u64 gva;
+	u64 rip;
+	u64 cr3;
+} __attribute__((packed));
+
+struct kvm_ept_violation_tracker {
+	int max_number_of_entries;
+	struct kvm_ept_violation_tracker_entry entries[];
+} __attribute__((packed));
 
 struct kvm_splitpage {
 		gpa_t gpa;
