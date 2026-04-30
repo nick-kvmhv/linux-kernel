@@ -1479,13 +1479,9 @@ int split_tlb_handle_ept_violation(struct kvm_vcpu *vcpu,gpa_t gpa,unsigned long
 				split_tlb_unprotect_pte(vcpu->kvm, &spages->pages[i]);
 			}
 		}
-		if (mtf_armed) {
-			/* 
-			 * Return 0 (false) to let KVM's mmu_page_fault run.
-			 * Since we just removed the page track, KVM will make the EPT writable.
-			 */
-			return 0;
-		}
+		if (mtf_armed)
+			/* The fault is handled. Let the guest re-execute the instruction. */
+			return 1;
 	}
 
 	*splitresult = 1;
