@@ -3056,9 +3056,11 @@ static int set_spte(struct kvm_vcpu *vcpu, u64 *sptep,
 	struct kvm_splitpage* page = split_tlb_findpage(vcpu->kvm, gfn<<PAGE_SHIFT);
 
 	if (COULD_BE_SPLIT_PAGE(*sptep)) {
-	   //tlbs debug
-		printk(KERN_WARNING "set_spte: got something that looks like active split page in setter spte:0x%llx/0x%llx\n",*sptep,(u64)sptep);
-		WARN_ON(1);
+		if (unlikely(!page)) {
+			pr_err("KVM: Ghost hook detected in set_spte! SPTE at %p (0x%llx) looks like a hook, but no tracker exists for GFN 0x%llx.\n",
+			       sptep, *sptep, gfn);
+			WARN_ON(1);
+		}
 	}
 
 	if (set_mmio_spte(vcpu, sptep, gfn, pfn, pte_access))
@@ -3170,9 +3172,11 @@ static int mmu_set_spte(struct kvm_vcpu *vcpu, u64 *sptep,
 		 *sptep, write_fault, gfn);
 
 	if (COULD_BE_SPLIT_PAGE(*sptep)) {
-	   //tlbs debug
-		printk(KERN_WARNING "mmu_set_spte: got something that looks like split page in setter spte:0x%llx\n",*sptep);
-		WARN_ON(1);
+		if (unlikely(!split_tlb_findpage(vcpu->kvm, gfn << PAGE_SHIFT))) {
+			pr_err("KVM: Ghost hook detected in mmu_set_spte! SPTE at %p (0x%llx) looks like a hook, but no tracker exists for GFN 0x%llx.\n",
+			       sptep, *sptep, gfn);
+			WARN_ON(1);
+		}
 	}
 
 	if (is_shadow_present_pte(*sptep)) {
