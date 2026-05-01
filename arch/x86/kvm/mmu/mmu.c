@@ -1526,11 +1526,6 @@ out:
 
 static void drop_spte(struct kvm *kvm, u64 *sptep)
 {
-	if (COULD_BE_SPLIT_PAGE(*sptep)) {
-	   //tlbs debug
-		printk(KERN_WARNING "drop_spte: got something that looks like split page in setter spte:0x%llx checkerfunc:%d\n",*sptep,split_tlb_has_split_page(kvm,sptep));
-		WARN_ON(1);
-	}
 	if (mmu_spte_clear_track_bits(sptep))
 		rmap_remove(kvm, sptep);
 }
