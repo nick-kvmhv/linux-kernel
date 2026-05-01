@@ -3303,6 +3303,10 @@ u64* split_tlb_findspte(struct kvm_vcpu *vcpu,gfn_t gfn, int callback(u64* sptep
 	
 	for_each_shadow_entry(vcpu, gfn << PAGE_SHIFT, iterator) {
 		u64 spte = iterator.sptep?split_tlb_safe_deref(iterator.sptep):0;
+
+		if (spte == 0)
+			break;
+
 		if (spte != 0) {
 			int last = is_last_spte(spte, iterator.level);
 			int large = is_large_pte(spte);
