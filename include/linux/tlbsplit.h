@@ -20,6 +20,7 @@ struct kvm_tlbsplit_pervcpu {
 	unsigned long flip_tick;
 	bool mtf_active;
 	u64 mtf_pte_gfn;
+	u64 mtf_thrash_gpa;
 };
 
 #include <linux/kvm_host.h>

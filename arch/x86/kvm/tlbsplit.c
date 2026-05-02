@@ -426,10 +426,9 @@ int split_tlb_activatepage(struct kvm_vcpu *vcpu, gva_t gva, ulong cr3) {
 	spin_unlock(&vcpu->kvm->splitpages->track_lock);
 
 	if (gpa_changed) {
-		if (old_gpa != 0) {
+		if (old_gpa != 0)
 			split_tlb_allow_thp(vcpu->kvm, old_gpa);
-			printk(KERN_WARNING "split:tlb_activatepage gpa changed 0x%llx->0x%llx, adjusting vm:%x\n",old_gpa,gpa&PAGE_MASK, vcpu->kvm->splitpages->vmcounter);
-		}
+		printk(KERN_WARNING "split:tlb_activatepage gpa changed 0x%llx->0x%llx, adjusting vm:%x\n",old_gpa,gpa&PAGE_MASK, vcpu->kvm->splitpages->vmcounter);
 		split_tlb_shatter_thp(vcpu, page->gpa);
 	}
 
@@ -915,7 +914,6 @@ int split_tlb_flip_page(struct kvm_vcpu *vcpu, gpa_t gpa, struct kvm_splitpage* 
 				old_gpa = splitpage->gpa;
 				splitpage->gpa = 0;
 			}
-			splitpage->active = false;
 			spin_unlock(&vcpu->kvm->splitpages->track_lock);
 			if (old_gpa != 0)
 				split_tlb_allow_thp(vcpu->kvm, old_gpa);
@@ -1093,52 +1091,6 @@ int isPageSplit(struct kvm_vcpu *vcpu, gva_t addr, ulong cr3) {
 	}
 }
 
-/* 
- * a very hacky bypass for thrashing. It will only work if a 64 bit process has a thrashing issue
- * and it requires the thrashing page to have 0xC3 (retn) on it. If these assumptions are not true,
- * the process will crash. It also may crash if the stack is on the page boundary and the next stack
- * page is not yet mapped. This bypass is only triggered when emulation has failed, i.e. when the thrashing
- * occurred on an SSE2 instruction that is not handled by the emulator.
- */
-  
-static int inject_retn_bypass(struct kvm_vcpu *vcpu,unsigned char* buffer) {
-	
-	unsigned long rsp = kvm_register_read(vcpu, VCPU_REGS_RSP);
-	unsigned long rip = kvm_register_read(vcpu, VCPU_REGS_RIP);
-	unsigned long page_base = rip & PAGE_MASK;
-	int i;
-	unsigned long retn_rip = 0;
-	
-	struct x86_exception exception;
-	u32 access = (kvm_x86_ops.get_cpl(vcpu) == 3) ? PFERR_USER_MASK : 0;
-	gpa_t ret_on_stack;
-	
-	for (i=0; i<PAGE_SIZE; i++) {
-		if (buffer[i] == 0xC3) {
-			retn_rip = page_base + i;
-			printk(KERN_INFO "inject_retn_bypass: Found retn at 0x%lx vm:%x\n",retn_rip, vcpu->kvm->splitpages->vmcounter);
-			break;
-		} 
-	}
-	if (retn_rip == 0) {
-		printk(KERN_INFO "inject_retn_bypass: retn not found on page 0x%lx, will crash app vm:%x\n",page_base, vcpu->kvm->splitpages->vmcounter);
-	}
-	rsp-=8;
-	kvm_register_write(vcpu, VCPU_REGS_RSP,rsp);
-	ret_on_stack = vcpu->arch.walk_mmu->gva_to_gpa(vcpu, rsp, access, &exception);
-	if (ret_on_stack == UNMAPPED_GVA) {
-		printk(KERN_INFO "inject_retn_bypass: We are truly screwed because we crossed the page boundary for stack vm:%x\n", vcpu->kvm->splitpages->vmcounter);
-	} else {
-		int r = kvm_write_guest(vcpu->kvm,ret_on_stack,&rip,8);
-		if (r != 0) {
-			printk(KERN_WARNING "inject_retn_bypass: write gva:0x%lx gpa:0x%llx failed with the result %d vm:%x\n",rsp,ret_on_stack,r, vcpu->kvm->splitpages->vmcounter);
-		}
-		kvm_register_write(vcpu, VCPU_REGS_RIP,retn_rip);
-	}
-	return 0;
-}
-
-
 unsigned long long split_tlb_safe_deref(unsigned long long * ptr) {
 	unsigned long long result;
 	int triggered = 0;
@@ -1254,13 +1206,6 @@ int split_tlb_vmcall_dispatch(struct kvm_vcpu *vcpu)
 			emulate_result = kvm_emulate_instruction(vcpu,0);
 			rip_after = kvm_rip_read(vcpu);
 			printk(KERN_INFO "VMCALL: rip b4:0x%lx after:0x%lx result:%d vm:%x\n",rip,rip_after,emulate_result, vcpu->kvm->splitpages->vmcounter);
-			if (rip == rip_after) {
-				unsigned char * buffer = kmalloc(PAGE_SIZE, GFP_KERNEL);
-				unsigned long page_base = rip & PAGE_MASK;
-				read_guest_by_virtual(vcpu,page_base,buffer,PAGE_SIZE);
-				inject_retn_bypass(vcpu,buffer);
-				kfree(buffer);
-			}
 			return 1;
 			}
 		break;
@@ -1334,7 +1279,6 @@ static void split_tlb_evaluate_hook(struct kvm_vcpu *vcpu, int i)
 			old_gpa = spages->pages[i].gpa;
 			spages->pages[i].gpa = 0;
 		}
-		spages->pages[i].active = false;
 		spin_unlock(&spages->track_lock);
 		if (old_gpa != 0) {
 			printk(KERN_INFO "split_tlb: Hook suspended via Flush (Unmapped).\n");
@@ -1433,6 +1377,28 @@ int split_tlb_handle_mtf(struct kvm_vcpu *vcpu)
 	
 	/* (VMX handler will clear the CPU_BASED_MONITOR_TRAP_FLAG before calling this) */
 
+	if (vcpu->split_pervcpu.mtf_thrash_gpa) {
+		gpa_t thrash_gpa = vcpu->split_pervcpu.mtf_thrash_gpa;
+		struct kvm_splitpage* page;
+		vcpu->split_pervcpu.mtf_thrash_gpa = 0;
+		
+		spin_lock(&vcpu->kvm->mmu_lock);
+		page = split_tlb_findpage(vcpu->kvm, thrash_gpa);
+		if (page && page->active) {
+			u64* sptep = split_tlb_findspte(vcpu, thrash_gpa >> PAGE_SHIFT, split_tlb_findspte_callback);
+			if (sptep) {
+				u64 newspte = *sptep & ~(VMX_EPT_READABLE_MASK | VMX_EPT_WRITABLE_MASK | VMX_EPT_EXECUTABLE_MASK);
+				newspte |= VMX_EPT_EXECUTABLE_MASK;
+				newspte &= ~PT64_BASE_ADDR_MASK;
+				newspte |= page->codeaddr & PT64_BASE_ADDR_MASK;
+				*sptep = newspte;
+				kvm_flush_remote_tlbs(vcpu->kvm);
+			}
+		}
+		spin_unlock(&vcpu->kvm->mmu_lock);
+		printk(KERN_INFO "split_tlb: MTF thrash bypass complete for GPA 0x%llx\n", thrash_gpa);
+	}
+
 	if (!spages)
 		return 1;
 
@@ -1456,7 +1422,6 @@ int split_tlb_handle_mtf(struct kvm_vcpu *vcpu)
 						old_gpa = spages->pages[i].gpa;
 						spages->pages[i].gpa = 0;
 					}
-					spages->pages[i].active = false;
 					spin_unlock(&spages->track_lock);
 
 					if (old_gpa != 0) {
@@ -1508,6 +1473,8 @@ int split_tlb_handle_ept_violation(struct kvm_vcpu *vcpu,gpa_t gpa,unsigned long
 	struct kvm_splitpages *spages = vcpu->kvm->splitpages;
 	int i;
 
+	*splitresult = 1;
+
 	/* MTF ENTRY POINT: Did the hardware trap on our protected Guest Page Table? */
 	if (spages) {
 		bool mtf_armed = false;
@@ -1539,8 +1506,6 @@ int split_tlb_handle_ept_violation(struct kvm_vcpu *vcpu,gpa_t gpa,unsigned long
 			/* The fault is handled. Let the guest re-execute the instruction. */
 			return 1;
 	}
-
-	*splitresult = 1;
 
 	splitpage = split_tlb_findpage(vcpu->kvm,gpa);
 	if (splitpage!=NULL) {
@@ -1590,26 +1555,29 @@ int split_tlb_handle_ept_violation(struct kvm_vcpu *vcpu,gpa_t gpa,unsigned long
 				//log_from_emulation = 1;
 				er = kvm_emulate_instruction(vcpu,0);
 				//log_from_emulation = 0;
-				if (er==1) {
-					unsigned long rip_after = kvm_rip_read(vcpu);
-					if (rip_before == rip_after) {
-						spin_lock(&vcpu->kvm->mmu_lock);
-						splitpage = split_tlb_findpage(vcpu->kvm,gpa);
-						if (splitpage && splitpage->codepage) {
-						    printk(KERN_INFO "split_tlb_handle_ept_violation: emulation stuck r0x%lx/x0x%lx/x0x%lx qualification: 0x%lx count: %d. injecting bypass vm:0x%x\n",vcpu->split_pervcpu.last_read_rip,vcpu->split_pervcpu.last_exec_rip,rip_before,exit_qualification,thrashed,vcpu->kvm->splitpages->vmcounter);
-						    inject_retn_bypass(vcpu,(unsigned char *)splitpage->codepage);
-						} else 
-						    printk(KERN_INFO "split_tlb_handle_ept_violation: emulation stuck r0x%lx/x0x%lx/x0x%lx qualification: 0x%lx count: %d. page deactivated when injecting bypass vm:0x%x\n",vcpu->split_pervcpu.last_read_rip,vcpu->split_pervcpu.last_exec_rip,rip_before,exit_qualification,thrashed,vcpu->kvm->splitpages->vmcounter);
-						spin_unlock(&vcpu->kvm->mmu_lock);
-					} else {
-						//printk(KERN_INFO "split_tlb_handle_ept_violation: emulation successful r0x%lx/x0x%lx/x0x%lx->x0x%lx qualification: 0x%lx count: 0x%d vm:0x%x\n",vcpu->split_pervcpu.last_read_rip,vcpu->split_pervcpu.last_exec_rip,rip_before,rip_after,exit_qualification,thrashed,vcpu->kvm->splitpages->vmcounter);
-						vcpu->split_pervcpu.last_exec_count = 0;
-						vcpu->split_pervcpu.last_read_count = 0;
-					}
+				if (er == 1 && rip_before != kvm_rip_read(vcpu)) {
+					vcpu->split_pervcpu.last_exec_count = 0;
+					vcpu->split_pervcpu.last_read_count = 0;
 				} else {
-					printk(KERN_WARNING "handle_ept_violation on split page after emulation er:%d rip:0x%lx gpa:0x%llx exitrsn:%d\n",er,rip_before,gpa,vcpu->run->exit_reason);
-					*splitresult = 0;
-
+					printk(KERN_WARNING "handle_ept_violation: emulation stuck/failed er:%d rip:0x%lx gpa:0x%llx. Stepping over natively via MTF!\n", er, rip_before, gpa);
+					spin_lock(&vcpu->kvm->mmu_lock);
+					splitpage = split_tlb_findpage(vcpu->kvm, gpa);
+					if (splitpage) {
+						u64* sptep = split_tlb_findspte(vcpu, gpa >> PAGE_SHIFT, split_tlb_findspte_callback);
+						if (sptep) {
+							u64 newspte = *sptep & ~(VMX_EPT_READABLE_MASK | VMX_EPT_WRITABLE_MASK | VMX_EPT_EXECUTABLE_MASK);
+							newspte |= VMX_EPT_READABLE_MASK | VMX_EPT_EXECUTABLE_MASK;
+							newspte &= ~PT64_BASE_ADDR_MASK;
+							newspte |= splitpage->dataaddrphys & PT64_BASE_ADDR_MASK;
+							*sptep = newspte;
+							kvm_flush_remote_tlbs(vcpu->kvm);
+							
+							vcpu->split_pervcpu.mtf_thrash_gpa = splitpage->gpa;
+							vcpu->split_pervcpu.mtf_active = true;
+						}
+					}
+					spin_unlock(&vcpu->kvm->mmu_lock);
+					*splitresult = 1;
 				}
 			} else {
 				*splitresult = 1;
