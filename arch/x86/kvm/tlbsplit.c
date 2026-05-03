@@ -176,6 +176,7 @@ bool tlb_split_init(struct kvm *kvm) {
 void kvm_split_tlb_freepage(struct kvm *kvm, struct kvm_splitpage *page)
 {
 	gpa_t old_gpa = 0;
+	void *data, *code;
 	split_tlb_unprotect_pte(kvm, page);
 	/* Drop the THP restriction if this page was ever activated */
 	spin_lock(&kvm->splitpages->track_lock);
@@ -187,21 +188,24 @@ void kvm_split_tlb_freepage(struct kvm *kvm, struct kvm_splitpage *page)
 	page->pte_gpa = 0;
 	page->pte_gfn = 0;
 	page->active = false;
-	spin_unlock(&kvm->splitpages->track_lock);
-	if (old_gpa != 0)
-		split_tlb_allow_thp(kvm, old_gpa);
+
+	data = page->dataaddr;
+	code = page->codepage;
+	page->dataaddr = NULL;
+	page->codepage = NULL;
+
 	page->gva = 0;
 	page->codeaddr = 0;
 	page->mtf_exits = 0;
 	page->dataaddrphys = 0;
-	if (page->dataaddr) {
-		kfree(page->dataaddr);
-		page->dataaddr = NULL;
-	}
-	if (page->codepage) {
-		kfree(page->codepage);
-		page->codepage = NULL;
-	}
+	spin_unlock(&kvm->splitpages->track_lock);
+
+	if (old_gpa != 0)
+		split_tlb_allow_thp(kvm, old_gpa);
+	if (data)
+		kfree(data);
+	if (code)
+		kfree(code);
 }
 EXPORT_SYMBOL_GPL(kvm_split_tlb_freepage);
 
@@ -286,14 +290,23 @@ int split_tlb_setdatapage(struct kvm_vcpu *vcpu, gva_t gva, gva_t datagva, ulong
 	else
 		page = split_tlb_findpage_gva_cr3(vcpu->kvm,gva,cr3);
 	if (page == NULL) {
-		page = split_tlb_findpage_internal(vcpu->kvm,0);
+		int i;
+		spin_lock(&vcpu->kvm->splitpages->track_lock);
+		for (i = 0; i < KVM_MAX_SPLIT_PAGES; i++) {
+			if (vcpu->kvm->splitpages->pages[i].gva == 0) {
+				page = &vcpu->kvm->splitpages->pages[i];
+				page->gva = gva & PAGE_MASK; /* Claim it atomically! */
+				break;
+			}
+		}
+		spin_unlock(&vcpu->kvm->splitpages->track_lock);
+
 		if (page == NULL) {
 			printk(KERN_WARNING "No more slots in the split page table vm:%x\n", vcpu->kvm->splitpages->vmcounter);
 			return 0;
 		}
 		page->cr3 = cr3;
 		page->gpa = gpa&PAGE_MASK;
-		page->gva = gva&PAGE_MASK;
 		split_tlb_shatter_thp(vcpu, page->gpa);
 		page->dataaddr = kmalloc(4096,GFP_KERNEL);
 		page->dataaddrphys = virt_to_phys(page->dataaddr);
@@ -756,8 +769,11 @@ int split_tlb_procinfo(struct kvm_vcpu *vcpu,void* buf,uint buf_size,gva_t *user
 		WORD* buf = kmalloc(guest_upp.ImagePathName.Length*2, GFP_KERNEL);
 		char* buf2 = kmalloc(guest_upp.ImagePathName.Length+1, GFP_KERNEL);
 		int i;
-		if (read_guest_by_virtual(vcpu,(gva_t)guest_upp.ImagePathName.Buffer,buf,guest_upp.ImagePathName.Length * 2) == 0)
+		if (read_guest_by_virtual(vcpu,(gva_t)guest_upp.ImagePathName.Buffer,buf,guest_upp.ImagePathName.Length * 2) == 0) {
+			kfree(buf2);
+			kfree(buf);
 			return 0;
+		}
 		for (i = 0; i < guest_upp.ImagePathName.Length; i++) {
 			buf2[i] = (char)buf[i];
 		}
