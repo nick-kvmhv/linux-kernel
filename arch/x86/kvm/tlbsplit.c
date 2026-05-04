@@ -93,8 +93,8 @@ void split_init_debugfs(void) {
 
 static void split_tlb_register_ept_flip(gva_t gva, gva_t rip, unsigned long cr3, struct kvm *kvm, bool read) {
 	int vmnumber = kvm->splitpages->vmcounter;
-	int counter = atomic_inc_return(&split_tracker_next_write);
-	int nextRow = (counter - 1) % split_tracker->max_number_of_entries;
+	unsigned int counter = atomic_inc_return(&split_tracker_next_write);
+	unsigned int nextRow = (counter - 1) % (unsigned int)split_tracker->max_number_of_entries;
 	if (gva >= kvm->splitpages->adjust_from && gva <= kvm->splitpages->adjust_to) 
 		split_tracker->entries[nextRow].gva = gva - kvm->splitpages->adjust_by;
 	else
