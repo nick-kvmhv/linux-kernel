@@ -575,10 +575,7 @@ kvm_pfn_t pfn;
 	slot = kvm_vcpu_gfn_to_memslot(vcpu, gfn);
 	async = false;
 	pfn = __gfn_to_pfn_memslot(slot, gfn, false, &async, false, &writable);
-	if (async || !writable) {
-		printk(KERN_WARNING "ts_gfn_to_pfn: unexpected async:%d writable%d\n", async, writable);
-		WARN_ON(1);
-	}
+	WARN(async, "ts_gfn_to_pfn: unexpected async:%d\n", async);
 	return pfn << PAGE_SHIFT;
 	
 }
