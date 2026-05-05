@@ -202,6 +202,15 @@ void kvm_split_tlb_freepage(struct kvm *kvm, struct kvm_splitpage *page)
 
 	if (old_gpa != 0)
 		split_tlb_allow_thp(kvm, old_gpa);
+
+	/* 
+	 * The hook is permanently dying. We must flush the hardware TLBs 
+	 * to sever the guest's stale connection to the physical RAM before
+	 * returning it to the host's SLUB allocator.
+	 */
+	if (data || code)
+		kvm_flush_remote_tlbs(kvm);
+
 	if (data)
 		kfree(data);
 	if (code)
@@ -709,15 +718,23 @@ static int read_guest_by_virtual(struct kvm_vcpu *vcpu, gva_t from_gva, void* in
 
 int split_tlb_procinfo(struct kvm_vcpu *vcpu,void* buf,uint buf_size,gva_t *user_stack) {
 	struct kvm_segment gs;
-	TEB guest_teb;
-	PEB guest_peb;
-	RTL_USER_PROCESS_PARAMETERS guest_upp;
+	TEB *guest_teb;
+	PEB *guest_peb;
+	RTL_USER_PROCESS_PARAMETERS *guest_upp;
 	int guest_cpl = kvm_x86_ops.get_cpl(vcpu);
 	gva_t guest_teb_addr;
 	char* printbuf = (char*) buf;
 	int printed;
 	int remains = buf_size;
+	int ret = 0;
 	
+	guest_teb = kzalloc(sizeof(TEB), GFP_KERNEL);
+	guest_peb = kzalloc(sizeof(PEB), GFP_KERNEL);
+	guest_upp = kzalloc(sizeof(RTL_USER_PROCESS_PARAMETERS), GFP_KERNEL);
+
+	if (!guest_teb || !guest_peb || !guest_upp)
+		goto out;
+
 	memset(buf,0,buf_size);
 	kvm_get_segment(vcpu, &gs, VCPU_SREG_GS);
 	printed = scnprintf(printbuf,remains,"gs:(base=%llx,limit=%x,selector=%x) cpl:%d\n",gs.base,gs.limit,gs.selector,guest_cpl);
@@ -750,49 +767,59 @@ int split_tlb_procinfo(struct kvm_vcpu *vcpu,void* buf,uint buf_size,gva_t *user
 		*user_stack = 0;
 	} else {
 		*user_stack = 0;
-		return 0;
+		goto out;
 	}
 	
-	if (read_guest_by_virtual(vcpu,guest_teb_addr,&guest_teb,sizeof guest_teb) == 0)
-		return 0;
+	if (read_guest_by_virtual(vcpu,guest_teb_addr,guest_teb,sizeof *guest_teb) == 0)
+		goto out;
 		
-	if (read_guest_by_virtual(vcpu,(gva_t)guest_teb.ProcessEnvironmentBlock,&guest_peb,sizeof guest_peb) == 0)
-		return 0;
+	if (read_guest_by_virtual(vcpu,(gva_t)guest_teb->ProcessEnvironmentBlock,guest_peb,sizeof *guest_peb) == 0)
+		goto out;
 
-	if (read_guest_by_virtual(vcpu,(gva_t)guest_peb.ProcessParameters,&guest_upp,sizeof guest_upp) == 0)
-		return 0;
+	if (read_guest_by_virtual(vcpu,(gva_t)guest_peb->ProcessParameters,guest_upp,sizeof *guest_upp) == 0)
+		goto out;
 
-	printed = scnprintf(printbuf,remains,"peb.ImageBase: %llx ImagePathName.length %d ImagePathName.buffer %llx\n", (u64)guest_peb.ImageBaseAddress, guest_upp.ImagePathName.Length, (u64)guest_upp.ImagePathName.Buffer);
+	printed = scnprintf(printbuf,remains,"peb.ImageBase: %llx ImagePathName.length %d ImagePathName.buffer %llx\n", (u64)guest_peb->ImageBaseAddress, guest_upp->ImagePathName.Length, (u64)guest_upp->ImagePathName.Buffer);
 	printbuf += printed;
 	remains -= printed;
 
 	//printk(KERN_INFO "split_tlb_procinfo: peb.ImageBase: %llx ImagePathName.length %d ImagePathName.buffer %llx\n", (u64)guest_peb.ImageBaseAddress, guest_upp.ImagePathName.Length, (u64)guest_upp.ImagePathName.Buffer);
-	if (guest_upp.ImagePathName.Length < MAX_PATH_LENGTH) {
-		WORD* buf = kmalloc(guest_upp.ImagePathName.Length*2, GFP_KERNEL);
-		char* buf2 = kmalloc(guest_upp.ImagePathName.Length+1, GFP_KERNEL);
+	if (guest_upp->ImagePathName.Length < MAX_PATH_LENGTH) {
+		WORD* imgbuf = kmalloc(guest_upp->ImagePathName.Length*2, GFP_KERNEL);
+		char* buf2 = kmalloc(guest_upp->ImagePathName.Length+1, GFP_KERNEL);
 		int i;
-		if (read_guest_by_virtual(vcpu,(gva_t)guest_upp.ImagePathName.Buffer,buf,guest_upp.ImagePathName.Length * 2) == 0) {
+		if (!imgbuf || !buf2) {
 			kfree(buf2);
-			kfree(buf);
-			return 0;
+			kfree(imgbuf);
+			goto out;
 		}
-		for (i = 0; i < guest_upp.ImagePathName.Length; i++) {
-			buf2[i] = (char)buf[i];
+		if (read_guest_by_virtual(vcpu,(gva_t)guest_upp->ImagePathName.Buffer,imgbuf,guest_upp->ImagePathName.Length * 2) == 0) {
+			kfree(buf2);
+			kfree(imgbuf);
+			goto out;
 		}
-		buf2 [guest_upp.ImagePathName.Length] = 0;
+		for (i = 0; i < guest_upp->ImagePathName.Length; i++) {
+			buf2[i] = (char)imgbuf[i];
+		}
+		buf2 [guest_upp->ImagePathName.Length] = 0;
 		printed = scnprintf(printbuf,remains,"image path=%s\n", buf2);
 		printbuf += printed;
 		remains -= printed;
 		kfree(buf2);
-		kfree(buf);
+		kfree(imgbuf);
 		//printk(KERN_INFO "split_tlb_procinfo: image path=%s\n",buf2);		
 	} else { 
-		printed = scnprintf(printbuf,remains,"iimage path too long, ignoring\n");
+		printed = scnprintf(printbuf,remains,"image path too long, ignoring\n");
 		printbuf += printed;
 		remains -= printed;
 		//printk(KERN_INFO "split_tlb_procinfo: image path too long, ignoring");
 	}
-	return 1;
+	ret = 1;
+out:
+	kfree(guest_teb);
+	kfree(guest_peb);
+	kfree(guest_upp);
+	return ret;
 }
 
 static void print_stack_pages_to_log(struct kvm_vcpu *vcpu,struct file *file,int count, gva_t rsp, loff_t *pos, char * buffer) {
