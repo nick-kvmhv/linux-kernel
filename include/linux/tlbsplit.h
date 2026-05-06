@@ -48,10 +48,8 @@ struct kvm_splitpage {
 		gpa_t gpa;
 		gva_t gva;
 		unsigned long cr3;
-		void * dataaddr;
 		void * codepage;
 		hpa_t codeaddr;
-		hpa_t dataaddrphys;
 		u64 original_spte;
 		bool active;
 		gpa_t pte_gpa;
