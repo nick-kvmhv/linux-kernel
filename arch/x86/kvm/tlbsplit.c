@@ -1501,10 +1501,12 @@ int split_tlb_handle_mtf(struct kvm_vcpu *vcpu)
 					if (!was_active) {
 						printk(KERN_INFO "split_tlb: Hook for gva 0x%lx reactivated at new GPA: 0x%llx via MTF vm:%x\n", spages->pages[i].gva, new_gpa, vcpu->kvm->splitpages->vmcounter);
 						split_tlb_shatter_thp(vcpu, new_gpa);
+						kvm_zap_gfn_range(vcpu->kvm, new_gpa >> PAGE_SHIFT, (new_gpa >> PAGE_SHIFT) + 1);
 					} else if (old_gpa != 0) {
 						printk(KERN_INFO "split_tlb: Hook for gva 0x%lx relocated to new GPA: 0x%llx via MTF natively vm:%x\n", spages->pages[i].gva, new_gpa, vcpu->kvm->splitpages->vmcounter);
 						split_tlb_allow_thp(vcpu->kvm, old_gpa);
 						split_tlb_shatter_thp(vcpu, new_gpa);
+						kvm_zap_gfn_range(vcpu->kvm, new_gpa >> PAGE_SHIFT, (new_gpa >> PAGE_SHIFT) + 1);
 					}
 					
 					/* The page is back in RAM. Drop the EPT shield for native performance! */
